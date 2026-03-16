@@ -47,6 +47,24 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <pangolin/display/default_font.h>
 
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>
+
+#include <unordered_set>
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
+
+#ifdef __linux__
+#include <unistd.h>
+#elif _WIN32
+#include <direct.h>
+#define getcwd _getcwd
+#endif
+
+#include <cmath>
+
 namespace basalt {
 
 CamCalib::CamCalib(const std::string &dataset_path,
@@ -150,6 +168,9 @@ void CamCalib::initGui() {
 
   pangolin::Var<std::function<void(void)>> compute_vign(
       "ui.compute_vign", std::bind(&CamCalib::computeVign, this));
+
+  pangolin::Var<std::function<void(void)>> save_corner_images(
+      "ui.save_corner_images", std::bind(&CamCalib::saveCornerImages, this));
 
   setNumCameras(1);
 }
@@ -378,28 +399,77 @@ void CamCalib::computeProjections() {
     polar_data_log[c]->Clear();
     azimuth_data_log[c]->Clear();
 
+    // 用于记录最大重投影误差及其对应的角度
+    double max_polar_error = 0.0;
+    double max_polar_angle = 0.0;
+    double max_azimuth_error = 0.0;
+    double max_azimuth_angle = 0.0;
+
+    // 统计用于绘制的总点数
+    int total_polar_points = 0;
+    int total_azimuth_points = 0;
+    int total_polar_bins = 0;
+    int total_azimuth_bins = 0;
+
     for (int i = 0; i < polar_sum[c].rows(); i++) {
       if (polar_num[c][i] > MIN_POINTS_HIST) {
         double x_coord = ANGLE_BIN_SIZE * i + ANGLE_BIN_SIZE / 2.0;
         double mean_reproj = polar_sum[c][i] / polar_num[c][i];
 
+        // 记录最大误差和对应的角度
+        if (mean_reproj > max_polar_error) {
+          max_polar_error = mean_reproj;
+          max_polar_angle = x_coord;
+        }
+
+        // 统计用于绘制的点数和bin数
+        total_polar_points += polar_num[c][i];
+        total_polar_bins++;
+
         polar_data_log[c]->Log(x_coord, mean_reproj);
       }
     }
-
-    polar_plotter->AddSeries(
-        "$0", "$1", pangolin::DrawingModeLine, cam_colors[c],
-        "mean error(pix) vs polar angle(deg) for cam" + std::to_string(c),
-        polar_data_log[c].get());
 
     for (int i = 0; i < azimuth_sum[c].rows(); i++) {
       if (azimuth_num[c][i] > MIN_POINTS_HIST) {
         double x_coord = ANGLE_BIN_SIZE * i + ANGLE_BIN_SIZE / 2.0 - 180.0;
         double mean_reproj = azimuth_sum[c][i] / azimuth_num[c][i];
 
+        // 记录最大误差和对应的角度
+        if (mean_reproj > max_azimuth_error) {
+          max_azimuth_error = mean_reproj;
+          max_azimuth_angle = x_coord;
+        }
+
+        // 统计用于绘制的点数和bin数
+        total_azimuth_points += azimuth_num[c][i];
+        total_azimuth_bins++;
+
         azimuth_data_log[c]->Log(x_coord, mean_reproj);
       }
     }
+
+    // 打印最大重投影误差信息和总点数
+    if (max_polar_error > 0.0) {
+      std::cout << "[Camera " << c << "] Max polar angle reprojection error: "
+                << std::fixed << std::setprecision(4) << max_polar_error
+                << " pixels at polar angle: " << std::setprecision(2) 
+                << max_polar_angle << " degrees (total points: " 
+                << total_polar_points << ", bins: " << total_polar_bins << ")" << std::endl;
+    }
+
+    if (max_azimuth_error > 0.0) {
+      std::cout << "[Camera " << c << "] Max azimuth angle reprojection error: "
+                << std::fixed << std::setprecision(4) << max_azimuth_error
+                << " pixels at azimuth angle: " << std::setprecision(2)
+                << max_azimuth_angle << " degrees (total points: " 
+                << total_azimuth_points << ", bins: " << total_azimuth_bins << ")" << std::endl;
+    }
+
+    polar_plotter->AddSeries(
+        "$0", "$1", pangolin::DrawingModeLine, cam_colors[c],
+        "mean error(pix) vs polar angle(deg) for cam" + std::to_string(c),
+        polar_data_log[c].get());
 
     azimuth_plotter->AddSeries(
         "$0", "$1", pangolin::DrawingModeLine, cam_colors[c],
@@ -417,9 +487,16 @@ void CamCalib::detectCorners() {
   processing_thread.reset(new std::thread([this]() {
     std::cout << "Started detecting corners" << std::endl;
 
+    auto t_start = std::chrono::high_resolution_clock::now();
+
     CalibHelper::detectCorners(this->vio_dataset, this->april_grid,
                                this->calib_corners,
                                this->calib_corners_rejected);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto detect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         t_end - t_start)
+                         .count();
 
     std::string path =
         cache_path + cache_dataset_name + "_detected_corners.cereal";
@@ -429,8 +506,76 @@ void CamCalib::detectCorners() {
     archive(this->calib_corners);
     archive(this->calib_corners_rejected);
 
+    // 统计角点数量（参与/被拒绝）
+    size_t good_obs = calib_corners.size();
+    size_t bad_obs = calib_corners_rejected.size();
+    size_t good_pts = 0;
+    size_t bad_pts = 0;
+    std::unordered_set<int64_t> frames_with_good;
+    std::unordered_set<int64_t> frames_with_rejected;
+    for (const auto &kv : calib_corners) {
+      good_pts += kv.second.corners.size();
+      if (!kv.second.corners.empty())
+        frames_with_good.insert(kv.first.frame_id);
+    }
+    for (const auto &kv : calib_corners_rejected) {
+      bad_pts += kv.second.corners.size();
+      if (!kv.second.corners.empty())
+        frames_with_rejected.insert(kv.first.frame_id);
+    }
+    std::unordered_set<int64_t> frames_with_any = frames_with_good;
+    frames_with_any.insert(frames_with_rejected.begin(),
+                           frames_with_rejected.end());
+
     std::cout << "Done detecting corners. Saved them here: " << path
+              << " | good obs: " << good_obs << " good pts: " << good_pts
+              << " good images (has good corners): " << frames_with_good.size()
+              << " | rejected obs: " << bad_obs << " rejected pts: " << bad_pts
+              << " rejected images (has rejected corners): "
+              << frames_with_rejected.size()
+              << " | images with any corners: " << frames_with_any.size()
+              << " | detect time: " << detect_ms << " ms"
               << std::endl;
+
+    // 打印每张图片的角点统计
+    // 注意：使用实际从数据集获取的时间戳，而不是从TimeCamId中获取
+    std::cout << "\n[PER-IMAGE CORNER STATS] Image corner statistics:" << std::endl;
+    std::map<int64_t, std::map<size_t, std::pair<size_t, size_t>>> image_stats;
+    for (const auto &kv : calib_corners) {
+      image_stats[kv.first.frame_id][kv.first.cam_id].first = kv.second.corners.size();
+    }
+    for (const auto &kv : calib_corners_rejected) {
+      image_stats[kv.first.frame_id][kv.first.cam_id].second = kv.second.corners.size();
+    }
+    
+    // 验证时间戳：从实际图像消息中获取时间戳进行对比
+    for (const auto &frame_kv : image_stats) {
+      int64_t timestamp_ns = frame_kv.first;
+      
+      for (const auto &cam_kv : frame_kv.second) {
+        size_t cam_id = cam_kv.first;
+        size_t good_count = cam_kv.second.first;
+        size_t rejected_count = cam_kv.second.second;
+        
+        // 如果可能，从实际图像消息头获取时间戳
+        int64_t actual_timestamp_ns = this->vio_dataset->get_actual_image_timestamp(timestamp_ns, cam_id);
+        
+        // 标记未使用的变量以避免编译警告
+        (void)good_count;
+        (void)rejected_count;
+        (void)actual_timestamp_ns;
+        (void)cam_id;
+        
+        // std::cout << "  Image timestamp_ns: " << timestamp_ns;
+        // if (actual_timestamp_ns != timestamp_ns) {
+        //   std::cout << " (actual from header.stamp: " << actual_timestamp_ns << ")";
+        // }
+        // std::cout << " cam_id: " << cam_id
+        //           << " good_corners: " << good_count
+        //           << " rejected_corners: " << rejected_count
+        //           << std::endl;
+      }
+    }
   }));
 
   if (!show_gui) {
@@ -439,7 +584,19 @@ void CamCalib::detectCorners() {
   }
 }
 
+/// @brief 初始化相机内参
+///
+/// 该函数用于初始化所有相机的基本内参（焦距和主点）。初始化过程分为两个阶段：
+/// 1. 首先尝试使用指定相机模型（如 kb4、ds 等）进行初始化
+/// 2. 对于初始化失败的相机，使用理想针孔模型作为备选方案
+///
+/// 初始化方法基于 Zhang 的标定方法，通过单应性矩阵估计初始内参。
+/// 初始化成功后，会设置相机分辨率并输出每个相机的内参值。
+///
+/// @note 调用此函数前必须先调用 detect_corners 完成角点检测
+/// @note 如果数据集图像数量超过 100 张，会跳过部分图像以加快处理速度
 void CamCalib::initCamIntrinsics() {
+  // 检查是否已检测到角点
   if (calib_corners.empty()) {
     std::cerr << "No corners detected. Press detect_corners to start corner "
                  "detection."
@@ -449,16 +606,22 @@ void CamCalib::initCamIntrinsics() {
 
   std::cout << "Started camera intrinsics initialization" << std::endl;
 
+  // 如果优化器未初始化，创建新的优化器对象
   if (!calib_opt) calib_opt.reset(new PosesOptimization);
 
+  // 根据相机数量和类型重置标定参数
   calib_opt->resetCalib(vio_dataset->get_num_cams(), cam_types);
 
+  // 标记每个相机是否已成功初始化
   std::vector<bool> cam_initialized(vio_dataset->get_num_cams(), false);
 
+  // 设置图像采样间隔：如果图像数量超过 100 张，每隔 3 张采样一次以加快速度
   int inc = 1;
   if (vio_dataset->get_image_timestamps().size() > 100) inc = 3;
 
+  // 第一阶段：使用指定相机模型初始化内参
   for (size_t j = 0; j < vio_dataset->get_num_cams(); j++) {
+    // 遍历图像序列，寻找能够成功初始化的图像
     for (size_t i = 0; i < vio_dataset->get_image_timestamps().size();
          i += inc) {
       const int64_t timestamp_ns = vio_dataset->get_image_timestamps()[i];
@@ -467,30 +630,36 @@ void CamCalib::initCamIntrinsics() {
 
       TimeCamId tcid(timestamp_ns, j);
 
+      // 检查该时间戳和相机 ID 是否检测到角点
       if (calib_corners.find(tcid) != calib_corners.end()) {
         CalibCornerData cid = calib_corners.at(tcid);
 
+        // 存储初始内参（4 个参数：fx, fy, cx, cy）
         Eigen::Vector4d init_intr;
 
+        // 使用 Zhang 方法通过单应性矩阵估计初始内参
+        // 该方法适用于各种相机模型（kb4、ds、eucm 等）
         bool success = CalibHelper::initializeIntrinsics(
             cid.corners, cid.corner_ids, april_grid, img_vec[j].img->w,
             img_vec[j].img->h, init_intr);
 
         if (success) {
           cam_initialized[j] = true;
+          // 将初始内参设置到相机模型中（会根据相机类型转换为相应参数）
           calib_opt->calib->intrinsics[j].setFromInit(init_intr);
-          break;
+          break;  // 成功初始化后跳出循环
         }
       }
     }
   }
 
-  // Try perfect pinhole initialization for cameras that are not initalized.
+  // 第二阶段：对于初始化失败的相机，使用理想针孔模型作为备选方案
   for (size_t j = 0; j < vio_dataset->get_num_cams(); j++) {
     if (!cam_initialized[j]) {
+      // 收集该相机所有包含足够角点的图像数据
       std::vector<CalibCornerData *> pinhole_corners;
-      int w = 0;
-      int h = 0;
+      int w = 0;  // 图像宽度
+      int h = 0;  // 图像高度
 
       for (size_t i = 0; i < vio_dataset->get_image_timestamps().size();
            i += inc) {
@@ -502,11 +671,13 @@ void CamCalib::initCamIntrinsics() {
 
         auto it = calib_corners.find(tcid);
         if (it != calib_corners.end()) {
+          // 只使用角点数量大于 8 的图像（确保有足够的约束）
           if (it->second.corners.size() > 8) {
             pinhole_corners.emplace_back(&it->second);
           }
         }
 
+        // 记录图像尺寸
         w = img_vec[j].img->w;
         h = img_vec[j].img->h;
       }
@@ -515,6 +686,7 @@ void CamCalib::initCamIntrinsics() {
 
       Eigen::Vector4d init_intr;
 
+      // 使用理想针孔模型初始化内参（基于多张图像的平均值）
       bool success = CalibHelper::initializeIntrinsicsPinhole(
           pinhole_corners, april_grid, w, h, init_intr);
 
@@ -530,6 +702,7 @@ void CamCalib::initCamIntrinsics() {
     }
   }
 
+  // 输出所有相机的初始化结果
   std::cout << "Done camera intrinsics initialization:" << std::endl;
   for (size_t j = 0; j < vio_dataset->get_num_cams(); j++) {
     std::cout << "Cam " << j << ": "
@@ -537,13 +710,13 @@ void CamCalib::initCamIntrinsics() {
               << std::endl;
   }
 
-  // set resolution
+  // 设置相机分辨率
   {
     size_t img_idx = 1;
     int64_t t_ns = vio_dataset->get_image_timestamps()[img_idx];
     auto img_data = vio_dataset->get_image_data(t_ns);
 
-    // Find the frame with all valid images
+    // 查找包含所有有效图像的帧
     while (img_idx < vio_dataset->get_image_timestamps().size()) {
       bool img_data_valid = true;
       for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
@@ -551,20 +724,23 @@ void CamCalib::initCamIntrinsics() {
       }
 
       if (!img_data_valid) {
+        // 如果当前帧无效，继续查找下一帧
         img_idx++;
         int64_t t_ns_new = vio_dataset->get_image_timestamps()[img_idx];
         img_data = vio_dataset->get_image_data(t_ns_new);
       } else {
-        break;
+        break;  // 找到有效帧后退出
       }
     }
 
+    // 提取所有相机的分辨率
     Eigen::aligned_vector<Eigen::Vector2i> res;
 
     for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
       res.emplace_back(img_data[i].img->w, img_data[i].img->h);
     }
 
+    // 将分辨率设置到优化器中
     calib_opt->setResolution(res);
   }
 }
@@ -734,11 +910,21 @@ void CamCalib::initOptimization() {
   calib_opt->setAprilgridCorners3d(april_grid.aprilgrid_corner_pos_3d);
 
   std::unordered_set<TimeCamId> invalid_frames;
+  size_t filtered_by_corner_count = 0;
+  size_t filtered_points_by_corner_count = 0;
+  
+  // 第一轮过滤：角点数量不足的帧
   for (const auto &kv : calib_corners) {
-    if (kv.second.corner_ids.size() < MIN_CORNERS)
+    if (kv.second.corner_ids.size() < MIN_CORNERS) {
       invalid_frames.insert(kv.first);
+      filtered_by_corner_count++;
+      filtered_points_by_corner_count += kv.second.corners.size();
+    }
   }
 
+  size_t filtered_by_pose_init = 0;
+  size_t filtered_points_by_pose_init = 0;
+  
   for (size_t j = 0; j < vio_dataset->get_image_timestamps().size(); ++j) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[j];
 
@@ -768,22 +954,59 @@ void CamCalib::initOptimization() {
       // Set all frames invalid if we do not have initial pose
       for (size_t cam_id = 0; cam_id < calib_opt->calib->T_i_c.size();
            cam_id++) {
-        invalid_frames.emplace(timestamp_ns, cam_id);
+        TimeCamId tcid(timestamp_ns, cam_id);
+        if (invalid_frames.count(tcid) == 0) {
+          invalid_frames.emplace(tcid);
+          filtered_by_pose_init++;
+          // 计算该帧被过滤掉的点数
+          const auto corners_it = calib_corners.find(tcid);
+          if (corners_it != calib_corners.end()) {
+            filtered_points_by_pose_init += corners_it->second.corners.size();
+          }
+        }
       }
     }
   }
 
+  size_t total_points_added = 0;
+  size_t total_detected_points = 0;
   for (const auto &kv : calib_corners) {
-    if (invalid_frames.count(kv.first) == 0)
+    total_detected_points += kv.second.corners.size();
+    if (invalid_frames.count(kv.first) == 0) {
       calib_opt->addAprilgridMeasurement(kv.first.frame_id, kv.first.cam_id,
                                          kv.second.corners,
                                          kv.second.corner_ids);
+      total_points_added += kv.second.corners.size();
+    }
   }
 
   calib_opt->init();
   computeProjections();
 
-  std::cout << "Initialized optimization." << std::endl;
+  std::cout << "Initialized optimization. Total points added: " << total_points_added 
+            << ", invalid frames: " << invalid_frames.size()
+            << ", poses added: " << calib_opt->getTimestampToPose().size() << std::endl;
+  std::cout << "[FILTERING STATS] Detected points: " << total_detected_points
+            << ", Added points: " << total_points_added
+            << ", Filtered points: " << (total_detected_points - total_points_added) << std::endl;
+  std::cout << "[FILTERING BREAKDOWN] Filtered by corner count < " << MIN_CORNERS 
+            << ": " << filtered_by_corner_count << " frames, " 
+            << filtered_points_by_corner_count << " points" << std::endl;
+  std::cout << "[FILTERING BREAKDOWN] Filtered by pose init inliers < " << MIN_CORNERS 
+            << ": " << filtered_by_pose_init << " frames, " 
+            << filtered_points_by_pose_init << " points" << std::endl;
+  
+  // Check if we have valid poses and points
+  if (calib_opt->getTimestampToPose().empty()) {
+    std::cerr << "[ERROR] No valid poses added to optimization. "
+              << "This may be because all frames have fewer than " << MIN_CORNERS 
+              << " inliers." << std::endl;
+  }
+  
+  if (total_points_added == 0) {
+    std::cerr << "[ERROR] No valid points added to optimization. "
+              << "This may be because all frames are marked as invalid." << std::endl;
+  }
 }  // namespace basalt
 
 void CamCalib::loadDataset() {
@@ -888,6 +1111,94 @@ bool CamCalib::optimizeWithParam(bool print_info,
     double reprojection_error;
     int num_points;
 
+    // 计算优化前的每张图片统计
+    if (print_info) {
+      std::map<std::pair<int64_t, size_t>, std::vector<double>> per_image_reproj_before;
+      std::map<std::pair<int64_t, size_t>, double> per_image_tz_before;
+      
+      for (const auto& acd : calib_opt->getAprilgridCornersMeasurements()) {
+        auto it_pose = calib_opt->getTimestampToPose().find(acd.timestamp_ns);
+        if (it_pose == calib_opt->getTimestampToPose().end()) continue;
+
+        Sophus::SE3d T_w_i = it_pose->second;
+        Sophus::SE3d T_w_c =
+            T_w_i * calib_opt->calib->T_i_c[acd.cam_id];
+        Sophus::SE3d T_c_w = T_w_c.inverse();
+        Eigen::Matrix4d T_c_w_m = T_c_w.matrix();
+        
+        std::pair<int64_t, size_t> key = {acd.timestamp_ns, acd.cam_id};
+        per_image_tz_before[key] = T_w_c.translation()[2];
+
+        std::visit(
+            [&](const auto& cam) {
+              for (size_t k = 0; k < acd.corner_pos.size(); k++) {
+                Eigen::Vector4d point3d =
+                    T_c_w_m * april_grid.aprilgrid_corner_pos_3d[acd.corner_id[k]];
+                Eigen::Vector2d proj;
+                if (cam.project(point3d, proj)) {
+                  double e = (acd.corner_pos[k] - proj).norm();
+                  per_image_reproj_before[key].push_back(e);
+                }
+              }
+            },
+            calib_opt->calib->intrinsics[acd.cam_id].variant);
+      }
+
+      // 打印优化前的统计
+      std::cout << "\n[BEFORE OPTIMIZATION] Per-image reprojection error and pose t_z:" << std::endl;
+      
+      // 打印优化前 t_z < 0 的图像
+      for (const auto& kv : per_image_tz_before) {
+        const auto& key = kv.first;
+        double tz = kv.second;
+        if (tz < 0) {
+          std::cout << "\n[BEFORE OPTIMIZATION] Images with t_z < 0:" << std::endl;
+          int64_t timestamp_ns = key.first;
+          size_t cam_id = key.second;
+          // 尝试获取图像文件名或使用时间戳
+          std::string image_name = "timestamp_" + std::to_string(timestamp_ns);
+          // 尝试从数据集获取实际时间戳（如果可用）
+          if (vio_dataset) {
+            int64_t actual_timestamp = vio_dataset->get_actual_image_timestamp(timestamp_ns, cam_id);
+            if (actual_timestamp != timestamp_ns) {
+              image_name += "_actual_" + std::to_string(actual_timestamp);
+            }
+          }
+          std::cout << "  Image: " << image_name 
+                    << " cam_id: " << cam_id
+                    << " t_z: " << tz << std::endl;
+        }
+      }
+      
+      for (const auto& kv : per_image_reproj_before) {
+        const auto& key = kv.first;
+        const auto& errors = kv.second;
+        if (errors.empty()) continue;
+        
+        double sum = 0.0, sum_sq = 0.0, max_err = 0.0;
+        for (double e : errors) {
+          sum += e;
+          sum_sq += e * e;
+          max_err = std::max(max_err, e);
+        }
+        double mean = sum / errors.size();
+        double std_dev = std::sqrt((sum_sq / errors.size()) - (mean * mean));
+        double tz = per_image_tz_before[key];
+        
+        // 标记未使用的变量以避免编译警告
+        (void)std_dev;
+        (void)tz;
+        
+        // std::cout << "  Image timestamp_ns: " << key.first 
+        //           << " cam_id: " << key.second
+        //           << " reproj_mean: " << mean
+        //           << " reproj_std: " << std_dev
+        //           << " reproj_max: " << max_err
+        //           << " t_z: " << tz
+        //           << std::endl;
+      }
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     converged = calib_opt->optimize(opt_intr, huber_thresh, stop_thresh, error,
@@ -907,6 +1218,46 @@ bool CamCalib::optimizeWithParam(bool print_info,
     }
 
     if (print_info) {
+      // 仅统计参与优化的帧/点（使用与优化相同的数据集）
+      double reproj_max = 0.0;
+      double reproj_sum = 0.0;
+      double reproj_sum_sq = 0.0;
+      int reproj_count = 0;
+
+      for (const auto& acd : calib_opt->getAprilgridCornersMeasurements()) {
+        auto it_pose = calib_opt->getTimestampToPose().find(acd.timestamp_ns);
+        if (it_pose == calib_opt->getTimestampToPose().end()) continue;
+
+        Sophus::SE3d T_w_i = it_pose->second;
+        Sophus::SE3d T_w_c =
+            T_w_i * calib_opt->calib->T_i_c[acd.cam_id];
+        Sophus::SE3d T_c_w = T_w_c.inverse();
+        Eigen::Matrix4d T_c_w_m = T_c_w.matrix();
+
+        std::visit(
+            [&](const auto& cam) {
+              for (size_t k = 0; k < acd.corner_pos.size(); k++) {
+                Eigen::Vector4d point3d =
+                    T_c_w_m * april_grid.aprilgrid_corner_pos_3d[acd.corner_id[k]];
+                Eigen::Vector2d proj;
+                if (cam.project(point3d, proj)) {
+                  double e = (acd.corner_pos[k] - proj).norm();
+                  reproj_max = std::max(reproj_max, e);
+                  reproj_sum += e;
+                  reproj_sum_sq += e * e;
+                  reproj_count++;
+                }
+              }
+            },
+            calib_opt->calib->intrinsics[acd.cam_id].variant);
+      }
+
+      double reproj_mean = reproj_count > 0 ? reproj_sum / reproj_count : 0.0;
+      double reproj_std = reproj_count > 0
+                              ? std::sqrt((reproj_sum_sq / reproj_count) -
+                                          (reproj_mean * reproj_mean))
+                              : 0.0;
+
       std::cout << "==================================" << std::endl;
 
       for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
@@ -921,11 +1272,99 @@ bool CamCalib::optimizeWithParam(bool print_info,
                 << " mean_error " << error / num_points
                 << " reprojection_error " << reprojection_error
                 << " mean reprojection " << reprojection_error / num_points
+                << " reproj_std " << reproj_std
+                << " reproj_max " << reproj_max
                 << " opt_time "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
                        finish - start)
                        .count()
                 << "ms." << std::endl;
+
+      // 计算优化后的每张图片统计
+      std::map<std::pair<int64_t, size_t>, std::vector<double>> per_image_reproj_after;
+      std::map<std::pair<int64_t, size_t>, double> per_image_tz_after;
+      
+      for (const auto& acd : calib_opt->getAprilgridCornersMeasurements()) {
+        auto it_pose = calib_opt->getTimestampToPose().find(acd.timestamp_ns);
+        if (it_pose == calib_opt->getTimestampToPose().end()) continue;
+
+        Sophus::SE3d T_w_i = it_pose->second;
+        Sophus::SE3d T_w_c =
+            T_w_i * calib_opt->calib->T_i_c[acd.cam_id];
+        Sophus::SE3d T_c_w = T_w_c.inverse();
+        Eigen::Matrix4d T_c_w_m = T_c_w.matrix();
+        
+        std::pair<int64_t, size_t> key = {acd.timestamp_ns, acd.cam_id};
+        per_image_tz_after[key] = T_w_c.translation()[2];
+
+        std::visit(
+            [&](const auto& cam) {
+              for (size_t k = 0; k < acd.corner_pos.size(); k++) {
+                Eigen::Vector4d point3d =
+                    T_c_w_m * april_grid.aprilgrid_corner_pos_3d[acd.corner_id[k]];
+                Eigen::Vector2d proj;
+                if (cam.project(point3d, proj)) {
+                  double e = (acd.corner_pos[k] - proj).norm();
+                  per_image_reproj_after[key].push_back(e);
+                }
+              }
+            },
+            calib_opt->calib->intrinsics[acd.cam_id].variant);
+      }
+
+      // 打印优化后的统计
+      std::cout << "\n[AFTER OPTIMIZATION] Per-image reprojection error and pose t_z:" << std::endl;
+      
+      // 打印优化后 t_z < 0 的图像
+      for (const auto& kv : per_image_tz_after) {
+        const auto& key = kv.first;
+        double tz = kv.second;
+        if (tz < 0) {
+          std::cout << "\n[AFTER OPTIMIZATION] Images with t_z < 0:" << std::endl;
+          int64_t timestamp_ns = key.first;
+          size_t cam_id = key.second;
+          // 尝试获取图像文件名或使用时间戳
+          std::string image_name = "timestamp_" + std::to_string(timestamp_ns);
+          // 尝试从数据集获取实际时间戳（如果可用）
+          if (vio_dataset) {
+            int64_t actual_timestamp = vio_dataset->get_actual_image_timestamp(timestamp_ns, cam_id);
+            if (actual_timestamp != timestamp_ns) {
+              image_name += "_actual_" + std::to_string(actual_timestamp);
+            }
+          }
+          std::cout << "  Image: " << image_name 
+                    << " cam_id: " << cam_id
+                    << " t_z: " << tz << std::endl;
+        }
+      }
+      
+      for (const auto& kv : per_image_reproj_after) {
+        const auto& key = kv.first;
+        const auto& errors = kv.second;
+        if (errors.empty()) continue;
+        
+        double sum = 0.0, sum_sq = 0.0, max_err = 0.0;
+        for (double e : errors) {
+          sum += e;
+          sum_sq += e * e;
+          max_err = std::max(max_err, e);
+        }
+        double mean = sum / errors.size();
+        double std_dev = std::sqrt((sum_sq / errors.size()) - (mean * mean));
+        double tz = per_image_tz_after[key];
+        
+        // 标记未使用的变量以避免编译警告
+        (void)std_dev;
+        (void)tz;
+        
+        // std::cout << "  Image timestamp_ns: " << key.first 
+        //           << " cam_id: " << key.second
+        //           << " reproj_mean: " << mean
+        //           << " reproj_std: " << std_dev
+        //           << " reproj_max: " << max_err
+        //           << " t_z: " << tz
+        //           << std::endl;
+      }
 
       if (converged) std::cout << "Optimization Converged !!" << std::endl;
 
@@ -947,6 +1386,173 @@ void CamCalib::saveCalib() {
     std::cout << "Saved calibration in " << cache_path << "calibration.json"
               << std::endl;
   }
+}
+
+// 辅助函数：绘制十字架
+static void drawCross(cv::Mat& img, const cv::Point2d& pt, int size, 
+                      const cv::Scalar& color, int thickness) {
+  // 水平线
+  cv::line(img, 
+           cv::Point2d(pt.x - size, pt.y),
+           cv::Point2d(pt.x + size, pt.y),
+           color, thickness);
+  // 垂直线
+  cv::line(img,
+           cv::Point2d(pt.x, pt.y - size),
+           cv::Point2d(pt.x, pt.y + size),
+           color, thickness);
+}
+
+void CamCalib::saveCornerImages() {
+  if (!vio_dataset.get()) {
+    std::cerr << "No dataset loaded. Please load dataset first." << std::endl;
+    return;
+  }
+
+  // 获取当前工作目录
+  char cwd[1024];
+  if (getcwd(cwd, sizeof(cwd)) == nullptr) {
+    std::cerr << "Failed to get current working directory." << std::endl;
+    return;
+  }
+  std::string work_dir = std::string(cwd) + "/";
+
+  // 创建保存目录 cam0 或 cam1
+  for (size_t cam_id = 0; cam_id < vio_dataset->get_num_cams(); cam_id++) {
+    std::string cam_dir = work_dir + "cam" + std::to_string(cam_id) + "/";
+    if (!fs::exists(cam_dir)) {
+      fs::create_directory(cam_dir);
+    }
+  }
+
+  std::cout << "Started saving corner images for all frames..." << std::endl;
+
+  // 遍历所有帧
+  size_t total_saved = 0;
+  for (size_t frame_id = 0; frame_id < vio_dataset->get_image_timestamps().size(); frame_id++) {
+    int64_t timestamp_ns = vio_dataset->get_image_timestamps()[frame_id];
+    const std::vector<ImageData> &img_vec =
+        vio_dataset->get_image_data(timestamp_ns);
+
+    for (size_t cam_id = 0; cam_id < vio_dataset->get_num_cams(); cam_id++) {
+      if (!img_vec[cam_id].img.get()) continue;
+
+      TimeCamId tcid(timestamp_ns, cam_id);
+
+      // 将图像转换为OpenCV Mat
+      const auto &img = img_vec[cam_id].img;
+      cv::Mat cv_img(img->h, img->w, CV_16UC1, (void *)img->ptr);
+      cv::Mat cv_img_8u;
+      cv_img.convertTo(cv_img_8u, CV_8U, 1.0 / 256.0);
+      cv::Mat cv_img_color;
+      cv::cvtColor(cv_img_8u, cv_img_color, cv::COLOR_GRAY2BGR);
+
+      // 在同一张图片上绘制所有三种角点
+      cv::Mat img_all = cv_img_color.clone();
+
+      // 1. 绘制检测到的角点（红色十字架，长度6，宽度1）
+      if (calib_corners.find(tcid) != calib_corners.end()) {
+        const CalibCornerData &cr = calib_corners.at(tcid);
+        for (size_t i = 0; i < cr.corners.size(); i++) {
+          cv::Point2d pt(cr.corners[i].x(), cr.corners[i].y());
+          drawCross(img_all, pt, 3, cv::Scalar(0, 0, 255), 1);  // BGR格式，红色
+        }
+      }
+
+      // 2. 绘制被拒绝的角点（蓝色十字架，长度6，宽度1）
+      if (calib_corners_rejected.find(tcid) != calib_corners_rejected.end()) {
+        const CalibCornerData &cr_rej = calib_corners_rejected.at(tcid);
+        for (size_t i = 0; i < cr_rej.corners.size(); i++) {
+          cv::Point2d pt(cr_rej.corners[i].x(), cr_rej.corners[i].y());
+          drawCross(img_all, pt, 2, cv::Scalar(255, 0, 0), 1);  // BGR格式，蓝色
+        }
+      }
+
+      // 3. 绘制优化后的投影角点（绿色十字架，长度4，宽度1）
+      // 同时计算重投影误差
+      double reproj_mean = 0.0;
+      double reproj_max = 0.0;
+      int reproj_count = 0;
+      
+      if (reprojected_corners.find(tcid) != reprojected_corners.end()) {
+        if (calib_corners.count(tcid) > 0 &&
+            calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
+          const auto &rc = reprojected_corners.at(tcid);
+          const CalibCornerData &cr = calib_corners.at(tcid);
+          
+          // 计算重投影误差：检测角点与投影角点的差异
+          for (size_t i = 0; i < rc.corners_proj.size(); i++) {
+            if (!rc.corners_proj_success[i]) continue;
+            
+            // 查找对应的检测角点（通过角点ID匹配）
+            for (size_t j = 0; j < cr.corner_ids.size(); j++) {
+              if (cr.corner_ids[j] == static_cast<int>(i)) {
+                double e = (cr.corners[j] - rc.corners_proj[i]).norm();
+                reproj_mean += e;
+                reproj_max = std::max(reproj_max, e);
+                reproj_count++;
+                break;
+              }
+            }
+          }
+          
+          // 绘制投影角点
+          for (size_t i = 0; i < rc.corners_proj.size(); i++) {
+            if (!rc.corners_proj_success[i]) continue;
+            cv::Point2d pt(rc.corners_proj[i].x(), rc.corners_proj[i].y());
+            drawCross(img_all, pt, 4, cv::Scalar(0, 255, 0), 1);  // BGR格式，绿色
+          }
+        }
+      }
+      
+      // 计算平均重投影误差
+      if (reproj_count > 0) {
+        reproj_mean /= reproj_count;
+      }
+
+      // 在图片左下角绘制重投影误差信息
+      if (reproj_count > 0) {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(3);
+        ss << "Mean: " << reproj_mean << " Max: " << reproj_max;
+        std::string text = ss.str();
+        
+        int font_face = cv::FONT_HERSHEY_SIMPLEX;
+        double font_scale = 0.6;
+        int thickness = 2;
+        cv::Size text_size = cv::getTextSize(text, font_face, font_scale, thickness, nullptr);
+        
+        // 在左下角绘制，留出一些边距
+        int margin = 10;
+        cv::Point text_pos(margin, img_all.rows - margin);
+        
+        // 绘制文字背景（黑色半透明）
+        cv::rectangle(img_all, 
+                     cv::Point(text_pos.x - 5, text_pos.y - text_size.height - 5),
+                     cv::Point(text_pos.x + text_size.width + 5, text_pos.y + 5),
+                     cv::Scalar(0, 0, 0), -1);
+        
+        // 绘制白色文字
+        cv::putText(img_all, text, text_pos, font_face, font_scale, 
+                   cv::Scalar(255, 255, 255), thickness);
+      }
+
+      // 使用时间戳作为文件名（与输入图片一致）
+      std::string cam_dir = work_dir + "cam" + std::to_string(cam_id) + "/";
+      std::string filename = cam_dir + std::to_string(timestamp_ns) + ".png";
+      cv::imwrite(filename, img_all);
+      total_saved++;
+    }
+
+    // 每处理100帧输出一次进度
+    if ((frame_id + 1) % 100 == 0) {
+      std::cout << "Processed " << (frame_id + 1) << " / " 
+                << vio_dataset->get_image_timestamps().size() << " frames" << std::endl;
+    }
+  }
+
+  std::cout << "Done saving corner images. Total saved: " << total_saved 
+            << " images to " << work_dir << "cam*/" << std::endl;
 }
 
 void CamCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {

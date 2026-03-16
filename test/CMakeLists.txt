@@ -4,24 +4,28 @@ cmake_minimum_required(VERSION 3.10...3.18)
 
 include_directories(../thirdparty/basalt-headers/test/include)
 
+find_package(Threads REQUIRED)
 
 add_executable(test_spline_opt src/test_spline_opt.cpp)
-target_link_libraries(test_spline_opt gtest gtest_main basalt)
+target_link_libraries(test_spline_opt gtest gtest_main basalt Threads::Threads)
 
 add_executable(test_vio src/test_vio.cpp)
-target_link_libraries(test_vio gtest gtest_main basalt)
+target_link_libraries(test_vio gtest gtest_main basalt Threads::Threads)
 
 add_executable(test_nfr src/test_nfr.cpp)
-target_link_libraries(test_nfr gtest gtest_main basalt)
+target_link_libraries(test_nfr gtest gtest_main basalt Threads::Threads)
 
 add_executable(test_qr src/test_qr.cpp)
-target_link_libraries(test_qr gtest gtest_main basalt)
+target_link_libraries(test_qr gtest gtest_main basalt Threads::Threads)
 
 add_executable(test_linearization src/test_linearization.cpp)
-target_link_libraries(test_linearization gtest gtest_main basalt)
+target_link_libraries(test_linearization gtest gtest_main basalt Threads::Threads)
 
 add_executable(test_patch src/test_patch.cpp)
-target_link_libraries(test_patch gtest gtest_main basalt)
+target_link_libraries(test_patch gtest gtest_main basalt Threads::Threads)
+
+add_executable(test_apriltag_demo src/test_apriltag_demo.cpp)
+target_link_libraries(test_apriltag_demo basalt basalt::opencv apriltag Threads::Threads)
 
 enable_testing()
 

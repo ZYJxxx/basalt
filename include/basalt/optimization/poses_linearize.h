@@ -44,6 +44,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/optimization/accumulator.h>
 
 #include <tbb/blocked_range.h>
+#include <map>
+#include <string>
 
 namespace basalt {
 
@@ -72,6 +74,10 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
   Scalar error;
   Scalar reprojection_error;
   int num_points;
+  int total_points;
+
+  // Projection failure statistics by camera model
+  std::map<std::string, ProjectionStats> stats_by_model;
 
   size_t opt_size;
 
@@ -87,6 +93,7 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
     error = 0;
     reprojection_error = 0;
     num_points = 0;
+    total_points = 0;
   }
   LinearizePosesOpt(const LinearizePosesOpt& other, tbb::split)
       : opt_size(other.opt_size), timestam_to_pose(other.timestam_to_pose) {
@@ -95,15 +102,15 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
     error = 0;
     reprojection_error = 0;
     num_points = 0;
+    total_points = 0;
   }
 
   void operator()(const tbb::blocked_range<AprilgridCornersDataIter>& r) {
     for (const AprilgridCornersData& acd : r) {
       std::visit(
           [&](const auto& cam) {
-            constexpr int INTRINSICS_SIZE =
-                std::remove_reference<decltype(cam)>::type::N;
-            typename LinearizeBase<Scalar>::template PoseCalibH<INTRINSICS_SIZE>
+            using CamT = typename std::remove_reference<decltype(cam)>::type;
+            typename LinearizeBase<Scalar>::template PoseCalibH<CamT::N>
                 cph;
 
             SE3 T_w_i = timestam_to_pose.at(acd.timestamp_ns);
@@ -116,10 +123,15 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
             double reproj_err = 0;
             int num_inliers = 0;
 
+            // Get camera model name for statistics
+            std::string model_name = CamT::getName();
+            ProjectionStats& stats = stats_by_model[model_name];
+
+            total_points += acd.corner_pos.size();
             for (size_t i = 0; i < acd.corner_pos.size(); i++) {
               this->linearize_point(acd.corner_pos[i], acd.corner_id[i],
                                     T_c_w_m, cam, &cph, err, num_inliers,
-                                    reproj_err);
+                                    reproj_err, &stats);
             }
 
             error += err;
@@ -152,16 +164,16 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
             }
 
             if (this->common_data.opt_intrinsics) {
-              accum.template addH<INTRINSICS_SIZE, POSE_SIZE>(
+              accum.template addH<CamT::N, POSE_SIZE>(
                   io, po, cph.H_intr_pose_accum * Adj);
 
               if (acd.cam_id > 0)
-                accum.template addH<INTRINSICS_SIZE, POSE_SIZE>(
+                accum.template addH<CamT::N, POSE_SIZE>(
                     io, co, -cph.H_intr_pose_accum);
 
-              accum.template addH<INTRINSICS_SIZE, INTRINSICS_SIZE>(
+              accum.template addH<CamT::N, CamT::N>(
                   io, io, cph.H_intr_accum);
-              accum.template addB<INTRINSICS_SIZE>(io, cph.b_intr_accum);
+              accum.template addB<CamT::N>(io, cph.b_intr_accum);
             }
           },
           this->common_data.calibration->intrinsics[acd.cam_id].variant);
@@ -173,6 +185,15 @@ struct LinearizePosesOpt : public LinearizeBase<Scalar> {
     error += rhs.error;
     reprojection_error += rhs.reprojection_error;
     num_points += rhs.num_points;
+    total_points += rhs.total_points;
+    
+    // Merge statistics
+    for (const auto& kv : rhs.stats_by_model) {
+      stats_by_model[kv.first].behind_camera += kv.second.behind_camera;
+      stats_by_model[kv.first].invalid_projection += kv.second.invalid_projection;
+      stats_by_model[kv.first].not_finite += kv.second.not_finite;
+      stats_by_model[kv.first].out_of_injective_area += kv.second.out_of_injective_area;
+    }
   }
 };
 

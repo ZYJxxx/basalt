@@ -131,11 +131,63 @@ class PosesOptimization {
     num_points = lopt.num_points;
     reprojection_error = lopt.reprojection_error;
 
+    int filtered_points = lopt.total_points - lopt.num_points;
     std::cout << "[LINEARIZE] Error: " << lopt.error << " num points "
-              << lopt.num_points << std::endl;
+              << lopt.num_points << " total points " << lopt.total_points
+              << " filtered points " << filtered_points << std::endl;
+    
+    // Print filtering thresholds
+    const double epsilon = Sophus::Constants<double>::epsilonSqrt();
+    std::cout << "[FILTERING THRESHOLDS] behind_camera: z < " << epsilon 
+              << " (epsilonSqrt)" << std::endl;
+    
+    // Aggregate statistics across all camera models
+    ProjectionStats total_stats;
+    for (const auto& kv : lopt.stats_by_model) {
+      total_stats.behind_camera += kv.second.behind_camera;
+      total_stats.invalid_projection += kv.second.invalid_projection;
+      total_stats.not_finite += kv.second.not_finite;
+      total_stats.out_of_injective_area += kv.second.out_of_injective_area;
+    }
+    
+    // Print aggregated filtering statistics
+    int total_filtered = total_stats.behind_camera + total_stats.invalid_projection + 
+                        total_stats.not_finite + total_stats.out_of_injective_area;
+    std::cout << "[FILTERED POINTS] Total: " << total_filtered 
+              << " | behind_camera: " << total_stats.behind_camera
+              << " | invalid_projection: " << total_stats.invalid_projection
+              << " | not_finite: " << total_stats.not_finite
+              << " | out_of_injective_area: " << total_stats.out_of_injective_area
+              << std::endl;
+    
+    // Print projection failure statistics by camera model (if any filtered)
+    if (!lopt.stats_by_model.empty() && total_filtered > 0) {
+      std::cout << "[PROJECTION STATS] Filtered points by camera model:" << std::endl;
+      for (const auto& kv : lopt.stats_by_model) {
+        const std::string& model_name = kv.first;
+        const ProjectionStats& stats = kv.second;
+        int model_filtered = stats.behind_camera + stats.invalid_projection + 
+                            stats.not_finite + stats.out_of_injective_area;
+        if (model_filtered > 0) {
+          std::cout << "  [" << model_name << "] "
+                    << "behind_camera: " << stats.behind_camera << ", "
+                    << "invalid_projection: " << stats.invalid_projection << ", "
+                    << "not_finite: " << stats.not_finite << ", "
+                    << "out_of_injective_area: " << stats.out_of_injective_area
+                    << " (total filtered: " << model_filtered << ")" << std::endl;
+        }
+      }
+    }
 
     lopt.accum.setup_solver();
     Eigen::VectorXd Hdiag = lopt.accum.Hdiagonal();
+
+    // Check if problem size is zero (no valid points/poses)
+    if (problem_size == 0 || num_points == 0) {
+      std::cout << "[WARNING] No valid points for optimization. Problem size: " 
+                << problem_size << ", num_points: " << num_points << std::endl;
+      return true;  // Return converged to avoid crash
+    }
 
     bool converged = false;
     bool step = false;
@@ -151,6 +203,14 @@ class PosesOptimization {
         Hdiag_lambda[i] = std::max(Hdiag_lambda[i], min_lambda);
 
       Eigen::VectorXd inc = -lopt.accum.solve(&Hdiag_lambda);
+      
+      // Check if inc is empty before calling maxCoeff
+      if (inc.size() == 0) {
+        std::cout << "[WARNING] Empty increment vector. Problem size: " 
+                  << problem_size << std::endl;
+        return true;  // Return converged to avoid crash
+      }
+      
       double max_inc = inc.array().abs().maxCoeff();
       if (max_inc < stop_thresh) converged = true;
 
@@ -287,6 +347,12 @@ class PosesOptimization {
   void setResolution(const Eigen::aligned_vector<Eigen::Vector2i> &resolution) {
     calib->resolution = resolution;
   }
+
+  const auto &getAprilgridCornersMeasurements() const {
+    return aprilgrid_corners_measurements;
+  }
+
+  const auto &getTimestampToPose() const { return timestam_to_pose; }
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 

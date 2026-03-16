@@ -62,8 +62,9 @@ int main(int argc, char **argv) {
                  "Name to save cached files");
 
   app.add_option("--skip-images", skip_images, "Number of images to skip");
+  // 这里的pinhole是无畸变的针孔相机
   app.add_option("--cam-types", cam_types,
-                 "Type of cameras (eucm, ds, kb4, pinhole)")
+                 "Type of cameras (eucm, ds, kb4, pinhole, pinhole-radtan8, ucm)")
       ->required();
 
   try {

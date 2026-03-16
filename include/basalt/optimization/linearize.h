@@ -42,6 +42,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace basalt {
 
+// Forward declaration for projection statistics
+struct ProjectionStats {
+  int behind_camera = 0;         // z < epsilon (点在相机后方)
+  int invalid_projection = 0;    // project() 返回 false
+  int not_finite = 0;            // 投影值不是有限值 (NaN/Inf)
+  int out_of_injective_area = 0; // 超出单射区域 (仅 radtan8)
+};
+
 template <typename Scalar>
 struct LinearizeBase {
   static const int POSE_SIZE = 6;
@@ -135,7 +143,8 @@ struct LinearizeBase {
   inline void linearize_point(const Eigen::Vector2d& corner_pos, int corner_id,
                               const Eigen::Matrix4d& T_c_w, const CamT& cam,
                               PoseCalibH<CamT::N>* cph, double& error,
-                              int& num_points, double& reproj_err) const {
+                              int& num_points, double& reproj_err,
+                              ProjectionStats* stats = nullptr) const {
     Eigen::Matrix<double, 2, 4> d_r_d_p;
     Eigen::Matrix<double, 2, CamT::N> d_r_d_param;
 
@@ -146,6 +155,14 @@ struct LinearizeBase {
     Eigen::Vector4d point3d =
         T_c_w * common_data.aprilgrid_corner_pos_3d->at(corner_id);
 
+    // Check if point is behind camera
+    const double z = point3d[2];
+    const double epsilon = Sophus::Constants<double>::epsilonSqrt();
+    if (z < epsilon) {
+      if (stats) stats->behind_camera++;
+      return;
+    }
+
     Eigen::Vector2d proj;
     bool valid;
     if (cph) {
@@ -153,7 +170,16 @@ struct LinearizeBase {
     } else {
       valid = cam.project(point3d, proj);
     }
-    if (!valid || !proj.array().isFinite().all()) return;
+    
+    if (!valid) {
+      if (stats) stats->invalid_projection++;
+      return;
+    }
+    
+    if (!proj.array().isFinite().all()) {
+      if (stats) stats->not_finite++;
+      return;
+    }
 
     Eigen::Vector2d residual = proj - corner_pos;
 

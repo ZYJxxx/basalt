@@ -126,6 +126,12 @@ class VioDataset {
   virtual int64_t get_mocap_to_imu_offset_ns() const = 0;
   virtual std::vector<ImageData> get_image_data(int64_t t_ns) = 0;
 
+  // Get actual timestamp from image message header (if available)
+  // Default implementation returns the input timestamp
+  virtual int64_t get_actual_image_timestamp(int64_t t_ns, size_t cam_id) const {
+    return t_ns;
+  }
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 

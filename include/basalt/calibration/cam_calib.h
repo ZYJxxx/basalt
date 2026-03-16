@@ -95,6 +95,8 @@ class CamCalib {
 
   void saveCalib();
 
+  void saveCornerImages();
+
   void drawImageOverlay(pangolin::View &v, size_t cam_id);
 
   bool hasCorners() const;

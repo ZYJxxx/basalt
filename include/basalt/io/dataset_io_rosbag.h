@@ -101,6 +101,22 @@ class RosbagVioDataset : public VioDataset {
 
   int64_t get_mocap_to_imu_offset_ns() const { return mocap_to_imu_offset_ns; }
 
+  // Get actual timestamp from image message header for a given timestamp key
+  int64_t get_actual_image_timestamp(int64_t t_ns, size_t cam_id) const override {
+    auto it = image_data_idx.find(t_ns);
+    if (it != image_data_idx.end() && cam_id < it->second.size() && 
+        it->second[cam_id].has_value()) {
+      const_cast<RosbagVioDataset*>(this)->m.lock();
+      sensor_msgs::ImageConstPtr img_msg =
+          bag->instantiateBuffer<sensor_msgs::Image>(*it->second[cam_id]);
+      const_cast<RosbagVioDataset*>(this)->m.unlock();
+      if (img_msg) {
+        return img_msg->header.stamp.toNSec();
+      }
+    }
+    return t_ns;  // Return original if cannot get actual timestamp
+  }
+
   std::vector<ImageData> get_image_data(int64_t t_ns) {
     std::vector<ImageData> res(num_cams);
 
@@ -242,7 +258,21 @@ class RosbagIO : public DatasetIoInterface {
       if (cam_topics.find(topic) != cam_topics.end()) {
         sensor_msgs::ImageConstPtr img_msg =
             m.instantiate<sensor_msgs::Image>();
-        int64_t timestamp_ns = img_msg->header.stamp.toNSec();
+        int64_t header_stamp_ns = img_msg->header.stamp.toNSec();
+        int64_t msg_time_ns = m.getTime().toNSec();
+        
+        // Debug: Print first few timestamps to verify
+        static int debug_count = 0;
+        if (debug_count < 5) {
+          std::cout << "[DEBUG] Image timestamp - header.stamp: " << header_stamp_ns 
+                    << ", m.getTime(): " << msg_time_ns 
+                    << ", topic: " << topic << std::endl;
+          debug_count++;
+        }
+        
+        // 使用 m.getTime() 作为时间戳，因为这是消息实际记录到bag的时间
+        // header.stamp 可能是错误的（如1970年），而 m.getTime() 是bag文件记录的实际时间
+        int64_t timestamp_ns = msg_time_ns;
 
         auto &img_vec = data->image_data_idx[timestamp_ns];
         if (img_vec.size() == 0) img_vec.resize(data->num_cams);

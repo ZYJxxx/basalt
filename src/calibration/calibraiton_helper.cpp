@@ -92,6 +92,7 @@ bool estimateTransformation(
                            AbsolutePoseSacProblem::KNEIP));
   ransac.sac_model_ = absposeproblem_ptr;
   ransac.threshold_ = 1.0 - cos(atan(sqrt(2.0) * 1 / cam_calib.getParam()[0]));
+  std::cout << "cam_calib.getParam()[0]: " << cam_calib.getParam()[0] << " threshold: " << ransac.threshold_ << std::endl;
   ransac.max_iterations_ = 50;
 
   ransac.computeModel();
@@ -175,184 +176,282 @@ void CalibHelper::initCamPoses(
                         calib_init_poses.emplace(tcid, cp);
                       }
                     });
+
+  // Print statistics for each frame after pose computation
+  std::cout << "\n[INIT POSE] Frame statistics (total_corners, num_inliers):" << std::endl;
+  for (const auto &tcid : corners) {
+    const CalibCornerData &ccd = calib_corners.at(tcid);
+    size_t total_corners = ccd.corners.size();
+    
+    auto it = calib_init_poses.find(tcid);
+    size_t num_inliers = 0;
+    if (it != calib_init_poses.end()) {
+      num_inliers = it->second.num_inliers;
+    }
+    
+    std::cout << "  timestamp_ns: " << tcid.frame_id 
+              << " cam_id: " << tcid.cam_id
+              << " total_corners: " << total_corners
+              << " num_inliers: " << num_inliers;
+    
+    if (num_inliers == 0) {
+      std::cout << " (failed)";
+    } else if (num_inliers < 8) {
+      std::cout << " (too few corners)";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
 }
 
+/// @brief 通过单张 AprilGrid 观测初始化通用相机内参
+///
+/// 该函数假设图像中心已知（取为图像中心），在图像中搜索一条“非径向”的
+/// AprilGrid 直线，用于初始化等距广角类相机模型的焦距（如 EUCM、DS、KB4 等）。
+/// 实现上基于文献中对等距成像的近似，将选取的角点构造成矩阵，使用 SVD
+/// 求解出一条最优成像直线，再由此反推出有效焦距。
+///
+/// 具体步骤：
+/// 1. 将像素坐标减去图像中心，构造每个角点的 \f$[u, v, 0.5, -0.5(u^2+v^2)]\f$
+///    四维向量，并按行/列遍历 AprilGrid 的角点组合成矩阵 \f$P\f$；
+/// 2. 对 \f$P\f$ 做 SVD，取最小奇异值对应的右奇异向量 \f$C\f$ 作为成像直线参数；
+/// 3. 过滤掉近似径向的直线，仅保留与光轴有足够夹角的候选直线；
+/// 4. 对每条候选直线估计焦距 \f$\gamma\f$，构造一个临时的
+///    `UnifiedCamera` 模型并估计位姿与重投影误差；
+/// 5. 选择重投影误差最小的候选，得到最终的 \f$\gamma_0\f$，并设置
+///    \f$[f_x, f_y, c_x, c_y] = [\gamma_0/2, \gamma_0/2, c_u, c_v]\f$ 作为初始内参。
+///
+/// 该初始化主要用于非针孔模型的第一阶段粗初始化，后续会在整体优化中联合精调。
+///
+/// @param[in]  corners     图像中检测到的 AprilGrid 角点像素坐标（单位：像素）
+/// @param[in]  corner_ids  每个角点对应的 AprilGrid 角点 ID（索引到 3D 角点坐标）
+/// @param[in]  aprilgrid   AprilGrid 标定板配置，包含 3D 角点坐标和网格尺寸
+/// @param[in]  cols        图像宽度（像素）
+/// @param[in]  rows        图像高度（像素）
+/// @param[out] init_intr   输出的初始内参向量 \f$[f_x, f_y, c_x, c_y]^T\f$
+///
+/// @return 如果成功找到合适的非径向直线并得到稳定的初始焦距，则返回 true；
+///         否则返回 false，不修改 @p init_intr。
 bool CalibHelper::initializeIntrinsics(
     const Eigen::aligned_vector<Eigen::Vector2d> &corners,
     const std::vector<int> &corner_ids, const AprilGrid &aprilgrid, int cols,
     int rows, Eigen::Vector4d &init_intr) {
-  // First, initialize the image center at the center of the image.
-
+  // 步骤 1：建立角点 ID 到像素坐标的映射，便于快速查找
   Eigen::aligned_map<int, Eigen::Vector2d> id_to_corner;
   for (size_t i = 0; i < corner_ids.size(); i++) {
     id_to_corner[corner_ids[i]] = corners[i];
   }
 
+  // 步骤 2：初始化参数
+  // _xi: Unified Camera Model 的投影参数（固定为 1.0）
   const double _xi = 1.0;
+  // _cu, _cv: 假设图像中心就是主点位置（像素坐标从 0 开始，所以减 0.5）
   const double _cu = cols / 2.0 - 0.5;
   const double _cv = rows / 2.0 - 0.5;
 
-  /// Initialize some temporaries needed.
-  double gamma0 = 0.0;
-  double minReprojErr = std::numeric_limits<double>::max();
+  // 步骤 3：初始化用于存储最佳结果的变量
+  double gamma0 = 0.0;  // 最佳焦距参数
+  double minReprojErr = std::numeric_limits<double>::max();  // 最小重投影误差
 
-  // Now we try to find a non-radial line to initialize the focal length
-  const size_t target_cols = aprilgrid.getTagCols();
-  const size_t target_rows = aprilgrid.getTagRows();
+  // 步骤 4：获取 AprilGrid 的尺寸信息
+  const size_t target_cols = aprilgrid.getTagCols();  // 标定板的列数（tag 数量）
+  const size_t target_rows = aprilgrid.getTagRows();  // 标定板的行数（tag 数量）
 
   bool success = false;
+  // 步骤 5：遍历两种角点偏移模式（每个 tag 有 4 个角点，可以取不同的起始角点）
   for (int tag_corner_offset = 0; tag_corner_offset < 2; tag_corner_offset++)
+    // 步骤 6：遍历 AprilGrid 的每一行（水平方向的直线）
     for (size_t r = 0; r < target_rows; ++r) {
-      // cv::Mat P(target.cols(); 4, CV_64F);
-
+      // 步骤 7：为当前行收集角点数据，构造矩阵 P
+      // P 的每一列是一个角点的四维向量 [u, v, 0.5, -0.5*(u^2+v^2)]
       Eigen::aligned_vector<Eigen::Vector4d> P;
 
+      // 遍历当前行的每一列
       for (size_t c = 0; c < target_cols; ++c) {
+        // 计算当前 tag 的角点 ID 偏移量（每个 tag 有 4 个角点）
         int tag_offset = (r * target_cols + c) << 2;
 
+        // 每个 tag 取 2 个角点（形成一条边）
         for (int i = 0; i < 2; i++) {
           int corner_id = tag_offset + i + tag_corner_offset * 2;
 
-          // std::cerr << corner_id << " ";
-
+          // 如果该角点在检测结果中存在
           if (id_to_corner.find(corner_id) != id_to_corner.end()) {
             const Eigen::Vector2d imagePoint = id_to_corner[corner_id];
 
-            double u = imagePoint[0] - _cu;
-            double v = imagePoint[1] - _cv;
+            // 步骤 8：将像素坐标转换为以图像中心为原点的坐标
+            double u = imagePoint[0] - _cu;  // 水平方向偏移
+            double v = imagePoint[1] - _cv;  // 垂直方向偏移
 
+            // 步骤 9：构造四维向量，用于等距投影模型的直线拟合
+            // 这个形式基于等距投影的数学特性：直线在图像中的投影满足特定约束
             P.emplace_back(u, v, 0.5, -0.5 * (square(u) + square(v)));
           }
         }
       }
 
-      // std::cerr << std::endl;
-
+      // 步骤 10：检查是否有足够的角点（至少 8 个）用于拟合直线
       const int MIN_CORNERS = 8;
-      // MIN_CORNERS is an arbitrary threshold for the number of corners
       if (P.size() > MIN_CORNERS) {
-        // Resize P to fit with the count of valid points.
-
+        // 步骤 11：将向量数组转换为矩阵形式（4 行 N 列，N 为角点数量）
         Eigen::Map<Eigen::Matrix4Xd> P_mat((double *)P.data(), 4, P.size());
 
-        // std::cerr << "P_mat\n" << P_mat.transpose() << std::endl;
-
+        // 步骤 12：转置矩阵，准备进行 SVD 分解
+        // P_mat_t 是 N×4 矩阵，每一行是一个角点的四维向量
         Eigen::MatrixXd P_mat_t = P_mat.transpose();
 
+        // 步骤 13：对矩阵进行奇异值分解（SVD）
+        // 目的是找到使所有点满足直线约束的参数向量 C
         Eigen::JacobiSVD<Eigen::MatrixXd> svd(
             P_mat_t, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
-        // std::cerr << "U\n" << svd.matrixU() << std::endl;
-        // std::cerr << "V\n" << svd.matrixV() << std::endl;
-        // std::cerr << "singularValues\n" << svd.singularValues() <<
-        // std::endl;
-
+        // 步骤 14：取最小奇异值对应的右奇异向量作为直线参数
+        // C 是 4 维向量，表示拟合出的直线参数
         Eigen::Vector4d C = svd.matrixV().col(3);
-        // std::cerr << "C\n" << C.transpose() << std::endl;
-        // std::cerr << "P*res\n" << P_mat.transpose() * C << std::endl;
 
+        // 步骤 15：检查参数的有效性
+        // t = C(0)^2 + C(1)^2 + C(2)*C(3)，必须为正数
         double t = square(C(0)) + square(C(1)) + C(2) * C(3);
         if (t < 0) {
-          continue;
+          continue;  // 无效参数，跳过
         }
 
-        // check that line image is not radial
+        // 步骤 16：检查该直线是否为非径向直线（不通过图像中心）
+        // 计算归一化的法向量分量
         double d = sqrt(1.0 / t);
-        double nx = C(0) * d;
-        double ny = C(1) * d;
+        double nx = C(0) * d;  // 法向量 x 分量
+        double ny = C(1) * d;  // 法向量 y 分量
+        
+        // 如果 hypot(nx, ny) > 0.95，说明直线接近径向（通过图像中心）
+        // 径向直线对焦距估计不敏感，需要过滤掉
         if (hypot(nx, ny) > 0.95) {
-          // std::cerr << "hypot(nx, ny) " << hypot(nx, ny) << std::endl;
-          continue;
+          continue;  // 跳过径向直线
         }
 
+        // 步骤 17：计算法向量的 z 分量（归一化）
         double nz = sqrt(1.0 - square(nx) - square(ny));
+        
+        // 步骤 18：从直线参数反推出焦距参数 gamma
+        // gamma 是等距投影模型中的有效焦距
         double gamma = fabs(C(2) * d / nz);
 
+        // 步骤 19：构造临时的 UnifiedCamera 模型用于验证
+        // 参数：fx=fy=gamma/2, cx=cu, cy=cv, xi=0.5
         Eigen::Matrix<double, 5, 1> calib;
         calib << 0.5 * gamma, 0.5 * gamma, _cu, _cv, 0.5 * _xi;
-        // std::cerr << "gamma " << gamma << std::endl;
 
         UnifiedCamera<double> cam_calib(calib);
 
+        // 步骤 20：使用临时相机模型估计标定板到相机的位姿变换
         size_t num_inliers;
         Sophus::SE3d T_target_camera;
         if (!estimateTransformation(cam_calib, corners, corner_ids,
                                     aprilgrid.aprilgrid_corner_pos_3d,
                                     T_target_camera, num_inliers)) {
-          continue;
+          continue;  // 位姿估计失败，跳过
         }
 
+        // 步骤 21：计算重投影误差，评估当前焦距估计的质量
         double reprojErr = 0.0;
         size_t numReprojected = computeReprojectionError(
             cam_calib, corners, corner_ids, aprilgrid.aprilgrid_corner_pos_3d,
             T_target_camera, reprojErr);
 
-        // std::cerr << "numReprojected " << numReprojected << " reprojErr "
-        //          << reprojErr / numReprojected << std::endl;
-
+        // 步骤 22：如果重投影误差足够小，更新最佳结果
         if (numReprojected > MIN_CORNERS) {
           double avgReprojErr = reprojErr / numReprojected;
 
+          // 选择重投影误差最小的候选作为最终结果
           if (avgReprojErr < minReprojErr) {
             minReprojErr = avgReprojErr;
-            gamma0 = gamma;
+            gamma0 = gamma;  // 保存最佳焦距
             success = true;
           }
         }
 
-      }  // If this observation has enough valid corners
-    }    // For each row in the image.
+      }  // 如果该行有足够的角点
+    }    // 遍历每一行
 
+  // 步骤 23：如果找到合适的非径向直线，设置初始内参
+  // fx = fy = gamma0/2（等距投影模型），cx = cu, cy = cv
   if (success) init_intr << 0.5 * gamma0, 0.5 * gamma0, _cu, _cv;
 
   return success;
 }
 
+/// @brief 使用 Zhang 标定方法初始化理想针孔相机内参
+///
+/// 该函数实现了 Zhang 经典标定算法，用多张 AprilGrid 图像估计针孔相机的
+/// 焦距和主点。假设图像中心接近主点位置，首先固定主点为图像中心，然后
+/// 对每一张图像估计平面单应性矩阵，再通过线性最小二乘求解焦距。
+///
+/// 主要步骤：
+/// 1. 对每张输入图像，构造世界平面点集（AprilGrid 角点在标定板平面上的 2D 坐标）
+///    与像素平面点集（检测到的角点像素坐标），使用 `cv::findHomography` 估计单应性 H；
+/// 2. 将 H 平移到以图像中心为原点的坐标系，计算列向量 h、v 及其和/差 d1、d2；
+/// 3. 对每张图像构造两行线性方程，堆叠得到线性系统 \f$A f = b\f$；
+/// 4. 通过 \f$(A^T A)^{-1} A^T b\f$ 求解 \f$f = [1/f_x^2, 1/f_y^2]^T\f$，
+///    再取平方根得到 \f$f_x, f_y\f$；
+/// 5. 最终将 \f$[f_x, f_y, c_x, c_y]\f$ 写入 @p init_intr 作为针孔模型的初始内参。
+///
+/// @param[in]  pinhole_corners  若干张图像的角点检测结果，每个元素对应一帧
+/// @param[in]  aprilgrid        AprilGrid 标定板配置，提供 3D/2D 角点位置
+/// @param[in]  cols             图像宽度（像素）
+/// @param[in]  rows             图像高度（像素）
+/// @param[out] init_intr        输出的初始针孔内参 \f$[f_x, f_y, c_x, c_y]^T\f$
+///
+/// @return 如果所有输入图像的单应性都成功估计且线性系统可解，返回 true；
+///         若任意图像单应性估计失败，则立即返回 false，不保证 @p init_intr 有效。
 bool CalibHelper::initializeIntrinsicsPinhole(
     const std::vector<CalibCornerData *> pinhole_corners,
     const AprilGrid &aprilgrid, int cols, int rows,
     Eigen::Vector4d &init_intr) {
-  // First, initialize the image center at the center of the image.
+  // 步骤 1：假设图像中心就是主点位置
+  // 这是 Zhang 方法的基本假设，对于大多数相机是合理的近似
+  const double _cu = cols / 2.0 - 0.5;  // 主点 x 坐标（像素坐标从 0 开始）
+  const double _cv = rows / 2.0 - 0.5;  // 主点 y 坐标
 
-  const double _cu = cols / 2.0 - 0.5;
-  const double _cv = rows / 2.0 - 0.5;
+  // 参考：Z. Zhang, A Flexible New Technique for Camera Calibration, PAMI 2000
 
-  // Z. Zhang, A Flexible New Technique for Camera Calibration, PAMI 2000
-
+  // 步骤 2：初始化线性系统
+  // 每张图像贡献 2 个方程，共 nImages 张图像，所以 A 是 2*nImages × 2 矩阵
+  // 求解的未知数是 f = [1/fx^2, 1/fy^2]^T
   size_t nImages = pinhole_corners.size();
 
-  //  Eigen::MatrixXd A(2 * nImages, 2);
-  //  Eigen::VectorXd b(2 * nImages);
+  Eigen::MatrixXd A(nImages * 2, 2);  // 系数矩阵
+  Eigen::VectorXd b(nImages * 2, 1);  // 常数项向量
 
-  Eigen::MatrixXd A(nImages * 2, 2);
-  Eigen::VectorXd b(nImages * 2, 1);
+  int i = 0;  // 当前图像索引
 
-  int i = 0;
-
+  // 步骤 3：对每张图像处理
   for (const CalibCornerData *ccd : pinhole_corners) {
-    const auto &corners = ccd->corners;
-    const auto &corner_ids = ccd->corner_ids;
+    const auto &corners = ccd->corners;      // 该图像的角点像素坐标
+    const auto &corner_ids = ccd->corner_ids; // 对应的角点 ID
 
+    // 步骤 4：准备单应性估计的输入数据
+    // M: 标定板平面上的 2D 坐标（AprilGrid 角点在标定板平面上的 X, Y 坐标）
+    // imagePoints: 图像中检测到的角点像素坐标
     std::vector<cv::Point2f> M(corners.size()), imagePoints(corners.size());
     for (size_t j = 0; j < corners.size(); ++j) {
+      // 提取标定板平面上的 2D 坐标（忽略 Z 坐标，因为标定板是平面）
       M.at(j) =
           cv::Point2f(aprilgrid.aprilgrid_corner_pos_3d[corner_ids[j]][0],
                       aprilgrid.aprilgrid_corner_pos_3d[corner_ids[j]][1]);
 
-      //    std::cout << "corner "
-      //              <<
-      //              aprilgrid.aprilgrid_corner_pos_3d[corner_ids[j]].transpose()
-      //              << std::endl;
-
+      // 提取图像中的像素坐标
       imagePoints.at(j) = cv::Point2f(corners[j][0], corners[j][1]);
     }
 
+    // 步骤 5：使用 OpenCV 估计单应性矩阵 H
+    // H 将标定板平面坐标映射到图像像素坐标：imagePoint = H * M
     cv::Mat H = cv::findHomography(M, imagePoints);
 
+    // 如果单应性估计失败，立即返回 false
     if (H.empty()) return false;
 
-    // std::cout << H << std::endl;
-
+    // 步骤 6：将单应性矩阵平移到以图像中心为原点的坐标系
+    // 这是为了利用 Zhang 方法中的约束条件
+    // 平移变换：H' = H - [cx; cy; 0] * H 的第三行
     H.at<double>(0, 0) -= H.at<double>(2, 0) * _cu;
     H.at<double>(0, 1) -= H.at<double>(2, 1) * _cu;
     H.at<double>(0, 2) -= H.at<double>(2, 2) * _cu;
@@ -360,48 +459,66 @@ bool CalibHelper::initializeIntrinsicsPinhole(
     H.at<double>(1, 1) -= H.at<double>(2, 1) * _cv;
     H.at<double>(1, 2) -= H.at<double>(2, 2) * _cv;
 
+    // 步骤 7：提取单应性矩阵的列向量
+    // h: H 的第一列（水平方向）
+    // v: H 的第二列（垂直方向）
     double h[3], v[3], d1[3], d2[3];
-    double n[4] = {0, 0, 0, 0};
+    double n[4] = {0, 0, 0, 0};  // 用于归一化的范数
 
     for (int j = 0; j < 3; ++j) {
-      double t0 = H.at<double>(j, 0);
-      double t1 = H.at<double>(j, 1);
+      double t0 = H.at<double>(j, 0);  // H 的第一列
+      double t1 = H.at<double>(j, 1);  // H 的第二列
       h[j] = t0;
       v[j] = t1;
-      d1[j] = (t0 + t1) * 0.5;
-      d2[j] = (t0 - t1) * 0.5;
-      n[0] += t0 * t0;
-      n[1] += t1 * t1;
-      n[2] += d1[j] * d1[j];
-      n[3] += d2[j] * d2[j];
+      // d1, d2: h 和 v 的和与差，用于构造约束方程
+      d1[j] = (t0 + t1) * 0.5;  // (h + v) / 2
+      d2[j] = (t0 - t1) * 0.5;  // (h - v) / 2
+      // 计算各向量的平方和，用于后续归一化
+      n[0] += t0 * t0;  // ||h||^2
+      n[1] += t1 * t1;  // ||v||^2
+      n[2] += d1[j] * d1[j];  // ||d1||^2
+      n[3] += d2[j] * d2[j];  // ||d2||^2
     }
 
+    // 步骤 8：计算归一化因子（各向量的范数）
     for (int j = 0; j < 4; ++j) {
-      n[j] = 1.0 / sqrt(n[j]);
+      n[j] = 1.0 / sqrt(n[j]);  // 1 / ||vector||
     }
 
+    // 步骤 9：归一化向量 h, v, d1, d2
     for (int j = 0; j < 3; ++j) {
-      h[j] *= n[0];
-      v[j] *= n[1];
-      d1[j] *= n[2];
-      d2[j] *= n[3];
+      h[j] *= n[0];   // 归一化 h
+      v[j] *= n[1];   // 归一化 v
+      d1[j] *= n[2];  // 归一化 d1
+      d2[j] *= n[3];  // 归一化 d2
     }
 
-    A(i * 2, 0) = h[0] * v[0];
-    A(i * 2, 1) = h[1] * v[1];
-    A(i * 2 + 1, 0) = d1[0] * d2[0];
-    A(i * 2 + 1, 1) = d1[1] * d2[1];
-    b(i * 2, 0) = -h[2] * v[2];
-    b(i * 2 + 1, 0) = -d1[2] * d2[2];
+    // 步骤 10：根据 Zhang 方法的约束条件构造线性方程
+    // 对于针孔相机，单应性矩阵的列向量满足以下约束：
+    // h[0]*v[0] / fx^2 + h[1]*v[1] / fy^2 = -h[2]*v[2]
+    // d1[0]*d2[0] / fx^2 + d1[1]*d2[1] / fy^2 = -d1[2]*d2[2]
+    // 设 f = [1/fx^2, 1/fy^2]^T，则上述约束可写成 A * f = b
+    A(i * 2, 0) = h[0] * v[0];      // 第一个方程的 fx^2 系数
+    A(i * 2, 1) = h[1] * v[1];      // 第一个方程的 fy^2 系数
+    A(i * 2 + 1, 0) = d1[0] * d2[0]; // 第二个方程的 fx^2 系数
+    A(i * 2 + 1, 1) = d1[1] * d2[1]; // 第二个方程的 fy^2 系数
+    b(i * 2, 0) = -h[2] * v[2];     // 第一个方程的常数项
+    b(i * 2 + 1, 0) = -d1[2] * d2[2]; // 第二个方程的常数项
 
-    i++;
+    i++;  // 移动到下一张图像
   }
 
+  // 步骤 11：求解线性最小二乘问题 A * f = b
+  // 使用 LDLT 分解求解：f = (A^T * A)^(-1) * A^T * b
+  // f = [1/fx^2, 1/fy^2]^T
   Eigen::Vector2d f = (A.transpose() * A).ldlt().solve(A.transpose() * b);
 
+  // 步骤 12：从 f 中恢复焦距 fx 和 fy
+  // fx = sqrt(1 / f[0]), fy = sqrt(1 / f[1])
   double fx = sqrt(fabs(1.0 / f(0)));
   double fy = sqrt(fabs(1.0 / f(1)));
 
+  // 步骤 13：设置最终的内参向量 [fx, fy, cx, cy]
   init_intr << fx, fy, _cu, _cv;
 
   return true;
@@ -429,6 +546,7 @@ void CalibHelper::computeInitialPose(
       calib->intrinsics[cam_id].variant);
 
   if (success) {
+    // std::cout << "size " << cd.corners.size() << " num_inliers " << num_inliers << std::endl;
     Eigen::Matrix4d T_c_a_init = cp.T_a_c.inverse().matrix();
 
     std::vector<bool> proj_success;
